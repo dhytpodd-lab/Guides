@@ -2,6 +2,7 @@
 
 > [!WARNING]
 > These Guides are Outdated! Remasters of these Guides will come soon.
+> But ARCH LINUX Guide was created recently.
 
 ## [Installing Windows](OS/Full-Windows/README.md)
 

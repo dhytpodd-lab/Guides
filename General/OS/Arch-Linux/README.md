@@ -1,218 +1,340 @@
-# Arch Linux ARM
+# Installing Arch Linux ARM on Qualcomm Snapdragon (Project Silicium)
 
-> [!WARNING]
-> This Guide is Outdated! A Remaster will come soon.
+This guide provides a complete, modern walkthrough for installing **Arch Linux ARM (aarch64)** on Qualcomm Snapdragon devices (such as the Xiaomi Redmi Note 13 4G / `sapphiren`) using **Project Silicium UEFI**.
 
-Make sure to check the Status of your Device [here](https://github.com/Robotix22/Mu-Qcom/blob/main/Status.md).
+The installation uses an **independent, label-based scheme (`ARCH_BOOT` and `ARCH_ROOT`)** alongside **`sgdisk`** for non-destructive, generic disk partitioning. The UEFI boot manager dynamically detects boot volumes and command-line parameters (`cmdline.txt`), eliminating hardcoded partition numbers.
 
-## Description
+---
 
-This Guide will show you how to Arch Linux Arm on your Device.
-You can either use built-in UFS storage, SD Card or external USB device.
+## 📋 Table of Contents
 
-<table>
-<tr><th>Table of Contents</th></th>
-<tr><td>
-  
-- Installing Arch Linux
-    - [What's needed](#needed-things)
-    - [Partition Device](#partition-device-step-1)
-        - [Partition UFS](#partition-ufs)
-        - [Partition USB](#partition-usb--sd-card-method-2)
-    - [Install](#installing-system-step-2)
-    - [Install Bootloader](#installing-and-configuring-refind-step-3)
-    - [Things to do post install](#things-to-do-post-installation)
+- [Requirements](#requirements)
+- [Storage & Partition Tree Structure](#storage--partition-tree-structure)
+- [Step 1: Backup GPT Partition Tables](#step-1-backup-gpt-partition-tables)
+- [Step 2: Partitioning Storage with sgdisk](#step-2-partitioning-storage-with-sgdisk)
+- [Step 3: Formatting Partitions with Labels](#step-3-formatting-partitions-with-labels)
+- [Step 4: Downloading Arch Linux ARM & Kernel](#step-4-downloading-arch-linux-arm--kernel)
+- [Step 5: Installing the System & Kernel](#step-5-installing-the-system--kernel)
+- [Step 6: System Configuration (fstab, cmdline.txt, users)](#step-6-system-configuration)
+- [Step 7: Booting via UEFI](#step-7-booting-via-uefi)
+- [Troubleshooting & Emergency Restore](#troubleshooting--emergency-restore)
 
-</td></tr> </table>
+---
 
-## Needed Things:
-   - PC / Laptop with Linux (VM can be used / WSL to be tested)
-   - Unlocked Bootloader
-   - [UEFI Image](https://github.com/Robotix22/Mu-Qcom/releases)
-   - [Generic Arch Linux Arm image](https://archlinuxarm.org/platforms/armv8/generic)
-   - [rEFInd](https://sourceforge.net/projects/refind/files/0.14.0.2/refind-bin-0.14.0.2.zip/download)
+## 🧰 Requirements
 
-## Partition Device (Step 1)
+- **Target Device** with an unlocked bootloader.
+- **Project Silicium UEFI Image**: Device build (e.g. `Mu-sapphiren.img`).
+- **Custom Recovery** (TWRP, OrangeFox, or PBRP) with working ADB shell.
+- **Host PC** (Linux, macOS, or Windows with WSL2/Git Bash) with `adb` and `fastboot` installed.
+- **Arch Linux ARM aarch64 Generic Rootfs**: `ArchLinuxARM-aarch64-latest.tar.gz`.
+- **Patched Mainline Kernel**: Pre-built `vmlinuz-linux` from [kernel-arch-sapphiren Releases](https://github.com/dhytpodd-lab/kernel-arch-sapphiren/releases).
 
-## Partition UFS (Method 1)
+---
 
-***⚠️ In this Section of the Guide you can easily brick your Device! ⚠️***
+## 🌲 Storage & Partition Tree Structure
 
-Boot into your Custom Recovery and unmount `userdata`, then open Command Promt on your PC / Laptop and enter ADB Shell. <br />
-Once in ADB Shell create a directory called `worksapce` in `/`:
+Snapdragon UFS devices organize internal storage across multiple Logical Units (LUNs). The main user data and Android firmware partitions reside on **LUN 0** (`/dev/block/sda` or `/dev/sda`).
+
+```text
+/dev/block/sda (UFS LUN 0)
+├── ... (Partitions 1 through N-1: Android Firmware, System, Vendor — DO NOT TOUCH)
+├── sda[N]   : userdata       [Android Data — shrunk to make space for Linux]
+├── sda[N+1] : esp (ARCH_BOOT) [FAT32, 1 GiB] -> Mounted to /boot
+└── sda[N+2] : arch (ARCH_ROOT) [ext4, 10 GiB+] -> Mounted to /
 ```
-mkdir /workspace/
+
+### Why Labels?
+By formatting with filesystem labels:
+- **`LABEL=ARCH_BOOT`**: Holds `vmlinuz-linux`, `initramfs-linux.img`, and optional `cmdline.txt`.
+- **`LABEL=ARCH_ROOT`**: Contains the Arch Linux ARM root filesystem (`/`).
+
+The UEFI firmware and the Linux kernel mount these filesystems automatically by label. Regardless of whether your partitions end up being `sda19/sda20`, `sda21/sda22`, or on an external USB OTG drive, the system **boots immediately without reconfiguration**.
+
+---
+
+## 🛡️ Step 1: Backup GPT Partition Tables
+
+> [!CAUTION]
+> Always backup your partition table before resizing or deleting partitions! This allows you to restore your exact original layout if needed.
+
+1. Boot your phone into **Recovery** (TWRP / OrangeFox) and connect it to your PC via USB.
+2. Open a terminal on your PC and enter the ADB shell:
+   ```bash
+   adb shell
+   ```
+3. Create a backup of the GPT partition table on `/dev/block/sda` using `sgdisk`:
+   ```bash
+   sgdisk --backup=/sdcard/gpt_backup_sda.bin /dev/block/sda
+   ```
+4. As an additional safeguard, create a binary dump of the protective MBR and primary GPT headers (first 34 sectors, 4096-byte UFS block size):
+   ```bash
+   dd if=/dev/block/sda of=/sdcard/sda_gpt_header.bin bs=4096 count=34
+   ```
+5. Pull the backups to your PC for safekeeping:
+   ```bash
+   # Run from your host PC terminal:
+   adb pull /sdcard/gpt_backup_sda.bin ./
+   adb pull /sdcard/sda_gpt_header.bin ./
+   ```
+
+---
+
+## ✂️ Step 2: Partitioning Storage with `sgdisk`
+
+> [!IMPORTANT]
+> `userdata` is almost always the very last partition on `/dev/block/sda`. We will shrink `userdata` and create two new partitions in the freed space at the end of the disk.
+
+1. Inspect your current partition table:
+   ```bash
+   sgdisk --print /dev/block/sda
+   ```
+   Note the partition number of `userdata` (typically `sda18` or similar), its **Start Sector**, and **End Sector**.
+
+2. (Optional) Expand partition table capacity:
+   If your device has a strict partition table limit, increase the allowed partition slots to 128:
+   ```bash
+   sgdisk --resize-table=128 /dev/block/sda
+   ```
+
+3. Unmount `userdata` if it was mounted by recovery:
+   ```bash
+   umount /data /sdcard 2>/dev/null
+   ```
+
+4. Delete the existing `userdata` partition entry:
+   *(Replace `<N>` with your userdata partition number, e.g., `18`)*:
+   ```bash
+   sgdisk --delete=<N> /dev/block/sda
+   ```
+
+5. Recreate a smaller `userdata` partition:
+   *(Allocate e.g. 30–60 GiB for Android, or calculate based on desired Linux space)*:
+   ```bash
+   # Syntax: --new=partnum:start_sector:end_sector
+   # Example: starting at original start, sized +32G:
+   sgdisk --new=<N>:<START_SECTOR>:+32G --change-name=<N>:userdata /dev/block/sda
+   ```
+
+6. Create the **ESP / Boot** partition (`1 GiB`, FAT32 type `EF00`):
+   ```bash
+   sgdisk --new=<N+1>:0:+1G --typecode=<N+1>:EF00 --change-name=<N+1>:esp /dev/block/sda
+   ```
+
+7. Create the **Arch Linux Root** partition (ext4 type `8300`, fills remaining space):
+   ```bash
+   sgdisk --new=<N+2>:0:0 --typecode=<N+2>:8300 --change-name=<N+2>:arch /dev/block/sda
+   ```
+
+8. Verify the new partition layout:
+   ```bash
+   sgdisk --print /dev/block/sda
+   ```
+
+9. Reread the partition table:
+   ```bash
+   partprobe /dev/block/sda
+   # If partprobe is unavailable or errors, simply reboot recovery:
+   reboot recovery
+   ```
+
+---
+
+## 🏷️ Step 3: Formatting Partitions with Labels
+
+Once booted in recovery with the new partition table active:
+
+```bash
+adb shell
 ```
-Then extract the .7z Files and push the content with `adb push` into the workspace folder:
+
+1. **Format Android Userdata**:
+   ```bash
+   # Format userdata with ext4 (or use recovery GUI -> Wipe -> Format Data):
+   mke2fs -t ext4 -F /dev/block/by-name/userdata
+   ```
+
+2. **Format ESP / Boot Partition with label `ARCH_BOOT`**:
+   ```bash
+   mkfs.vfat -F 32 -n ARCH_BOOT /dev/block/by-name/esp
+   ```
+
+3. **Format Arch Linux Root Partition with label `ARCH_ROOT`**:
+   ```bash
+   mke2fs -t ext4 -F -L ARCH_ROOT /dev/block/by-name/arch
+   ```
+
+---
+
+## ⬇️ Step 4: Downloading Arch Linux ARM & Kernel
+
+On your **Host PC**, download the required distribution tarball and pre-built kernel:
+
+1. **Download Arch Linux ARM aarch64 Generic Rootfs**:
+   ```bash
+   wget http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
+   ```
+
+2. **Download the Patched Mainline Kernel**:
+   Download the latest pre-built `vmlinuz-linux` from the [kernel-arch-sapphiren Releases](https://github.com/dhytpodd-lab/kernel-arch-sapphiren/releases):
+   ```bash
+   wget https://github.com/dhytpodd-lab/kernel-arch-sapphiren/releases/latest/download/vmlinuz-linux
+   ```
+
+3. **Push the downloaded files to your device**:
+   ```bash
+   adb push ArchLinuxARM-aarch64-latest.tar.gz /sdcard/
+   adb push vmlinuz-linux /sdcard/
+   ```
+
+---
+
+## 📦 Step 5: Installing the System & Kernel
+
+In the ADB shell on the device:
+
+1. **Mount partitions using labels**:
+   ```bash
+   mkdir -p /mnt/arch
+   mount /dev/disk/by-label/ARCH_ROOT /mnt/arch
+   mkdir -p /mnt/arch/boot
+   mount /dev/disk/by-label/ARCH_BOOT /mnt/arch/boot
+   ```
+
+2. **Extract rootfs onto root partition**:
+   ```bash
+   cd /mnt/arch
+   # Use tar or bsdtar with preserved permissions:
+   tar -xpf /sdcard/ArchLinuxARM-aarch64-latest.tar.gz -C /mnt/arch/
+   ```
+
+3. **Install the Kernel**:
+   Copy the pre-built `vmlinuz-linux` directly to `/mnt/arch/boot/`:
+   ```bash
+   cp /sdcard/vmlinuz-linux /mnt/arch/boot/vmlinuz-linux
+   ```
+
+4. **Generate or Install the Initramfs**:
+   - If you have pre-generated `initramfs-linux.img`, copy it directly:
+     ```bash
+     cp /sdcard/initramfs-linux.img /mnt/arch/boot/initramfs-linux.img
+     ```
+   - Alternatively, chroot into the installation and generate it using `mkinitcpio`:
+     ```bash
+     # Enter chroot
+     chroot /mnt/arch /bin/bash
+     
+     # Ensure base mkinitcpio is installed
+     mkinitcpio -P
+     
+     exit
+     ```
+
+---
+
+## ⚙️ Step 6: System Configuration
+
+### 1. Configure `/etc/fstab` (Label-Based)
+Edit `/mnt/arch/etc/fstab` so the system mounts partitions by label at boot without relying on hardcoded block device paths:
+
+```bash
+cat << 'EOF' > /mnt/arch/etc/fstab
+# <file system>        <mount point>  <type>  <options>         <dump>  <pass>
+LABEL=ARCH_ROOT        /              ext4    defaults,noatime  0       1
+LABEL=ARCH_BOOT        /boot          vfat    defaults          0       2
+EOF
 ```
-adb push parted gdisk /workspace/
+
+### 2. Configure `/boot/cmdline.txt`
+Project Silicium UEFI automatically checks for `cmdline.txt` on the `ARCH_BOOT` volume. Create it with your desired kernel parameters:
+
+```bash
+cat << 'EOF' > /mnt/arch/boot/cmdline.txt
+console=tty0 earlycon=efifb,ram keep_bootcon root=LABEL=ARCH_ROOT rw rootwait acpi=force clk_ignore_unused pd_ignore_unused ignore_loglevel systemd.journald.forward_to_console=1
+EOF
 ```
-After you copied parted and gdisk to workspace make it executable and run parted:
+
+> [!TIP]
+> If `cmdline.txt` is omitted, Project Silicium UEFI automatically falls back to this exact default command-line, booting `root=LABEL=ARCH_ROOT` out of the box!
+
+### 3. User Accounts & Root Password
+Chroot into the installation to configure basic access:
+
+```bash
+chroot /mnt/arch /bin/bash
+
+# Set root password
+echo "root:root" | chpasswd
+# Or set interactively:
+passwd root
+
+# Enable essential systemd services
+systemctl enable systemd-networkd
+systemctl enable systemd-resolved
+systemctl enable sshd 2>/dev/null || true
+
+exit
 ```
-# NOTE: If your device has memory type eMMC, instead of sda use mmcblk0!
-chmod 744 parted gdisk
-./parted /dev/block/sda
+
+### 4. USB Network Tethering (Automatic Internet on Boot)
+Configure `systemd-networkd` to automatically request an IP address whenever USB tethering or a USB-to-Ethernet adapter is connected:
+
+```bash
+cat << 'EOF' > /mnt/arch/etc/systemd/network/20-wired.network
+[Match]
+Name=en* eth* usb*
+
+[Network]
+DHCP=yes
+EOF
 ```
-Once you executed parted print the partition table:
+
+### 5. Cleanly Unmount Partitions
+```bash
+cd /
+umount -R /mnt/arch
+sync
 ```
-(parted) print
-```
-Find userdata in output and note the Number, Start and End Address. <br />
-Example:
-```
-# NOTE: Don't use these Values it just an Example!
-Number  Start   End     Size    File system  Name             Flags
-38      141GB   241GB   100GB                userdata
-```
-Once you noted the Number, Start and End Address delete userdata and create is again but smaller: <br />
-```
-# NOTE: Some devices use f2fs filesystem for userdata, ext4 won't suit them!
-# If you have a problem with the number of partitions
-# (can’t create another partition), you can try:
-# NOTE: If your device has memory type eMMC, instead of sda use mmcblk0!
-sgdisk --resize-table 99 /dev/block/sda # 99 number of maximum allowed partitions
-# Deleting userdata will wipe all your data in Android!
-(parted) rm <Number>
-(parted) mkpart userdata ext4 <Start> <End / 2>
-```
-After shrinking userdata We can move on to creating the other Partitions:
-```
-(parted) mkpart esp fat32 <End / 2> <End / 2 + 512MB>
-(parted) mkpart arch ext4 <End / 2 + 512MB> <End>
-```
-Now we set esp to active by running: `set <Number> esp on`. <br />
-Once that is done we exit parted and reboot again to recovery:
-```
-(parted) quit
+
+---
+
+## 🚀 Step 7: Booting via UEFI
+
+1. Reboot your phone into **Fastboot Mode**:
+   ```bash
+   adb reboot bootloader
+   ```
+2. On your host PC, boot the Project Silicium UEFI image (do not flash):
+   ```bash
+   fastboot boot Mu-sapphiren.img
+   ```
+3. **What happens next:**
+   - The device initializes displays via SimpleDRM / Continuous Splash.
+   - Project Silicium BDS connects all storage partitions on LUN 0.
+   - BDS detects `vmlinuz-linux` on the `ARCH_BOOT` partition.
+   - BDS loads `initramfs-linux.img` via the standard `LoadFile2` protocol in RAM.
+   - BDS reads `cmdline.txt` and executes the Linux kernel.
+   - Systemd detects `LABEL=ARCH_ROOT` and boots cleanly into the Arch Linux console!
+
+---
+
+## 🚑 Troubleshooting & Emergency Restore
+
+### Restoring Original Partition Table
+If partition creation failed or you want to return to stock Android partitions:
+```bash
+# In recovery ADB shell:
+sgdisk --load-backup=/sdcard/gpt_backup_sda.bin /dev/block/sda
 reboot recovery
 ```
-After that format the partitions:
+
+### Manual Root Specification
+If your root partition fails to mount, you can override `cmdline.txt` on the FAT32 `ARCH_BOOT` partition by plugging the phone into PC mass-storage mode or recovery, and changing:
+```text
+root=/dev/sda20
 ```
-mke2fs -t ext4 /dev/block/by-name/userdata        # Userdata
-mkfs.fat -F32 -s1 /dev/block/by-name/esp          # ESP
-mke2fs -t ext4 /dev/block/by-name/arch            # Arch
+or by PARTUUID:
+```text
+root=PARTUUID=12345678-1234-1234-1234-123456789abc
 ```
-If formatting userdata gives an error reboot to recovery and format userdata in the Custom Recovery GUI. <br />
-
-***⚠️ End of the Dangerous Section! ⚠️***
-
-### Mounting UFS
-
-If your Device has a Mass Storage Guide use that. <br />
-If Not, Use [Mass-Storage.zip](https://github.com/Robotix22/Mu-Qcom-Guides/files/11005130/Mass-Storage.zip) and copy it contents to a FAT32 Partition on your Device. <br />
-After that boot the UEFI Image then it enters Windows Boot Manager select `Developer Menu` -> `USB Mass Storage Mode`. <br />
-
-Then connect your Device to the PC / Laptop and find the Arch and esp partition. <br />
-
-Mount your device like this:
-```
-~/uefi » su root
-[root@wisnia uefi]# mkdir tmp
-[root@wisnia uefi]# mount /dev/sdx<number+2> tmp/
-[root@wisnia uefi]# mkdir tmp/boot
-[root@wisnia uefi]# mount /dev/sdx<number+1> tmp/boot/
-```
-
-## Partition USB / SD Card (Method 2)
-
-Use your favourite way to partition the USB drive according to this scheme:
-
-| Mount point   | Partition     | Partition Type| Suggested size    |
-| ------------- | ------------- | ------------- | -------------     |
-| mnt/boot      | Esp Part      | fat32         | 1 GiB             |
-| mnt           | Arch Root     | ext4          | Rest of the device|
-
-Then Create a temp folder somewhere on your pc and open a terminal.
-
-You can also copy the `ArchLinuxARM-aarch64-latest.tar.gz` you got earlier as you are gonna need it later
-
-Mount the External Storage Device according to the mount points above:
-
-Like this:
-```
-~/uefi » su root
-[root@wisnia uefi]# mkdir tmp
-[root@wisnia uefi]# mount /dev/sdx2 tmp/
-[root@wisnia uefi]# mkdir tmp/boot
-[root@wisnia uefi]# mount /dev/sdx1 tmp/boot/
-```
-
-## Installing System (Step 2)
-
-Unpack the rootfs onto the mounted device
-> NOTE: You **NEED** to be logged in as root, sudo won't work
-
-```
-~/uefi » su root
-[root@wisnia uefi]# bsdtar -xpf ArchLinuxARM-aarch64-latest.tar.gz -C tmp/
-```
-
-## Installing and configuring Refind (Step 3)
-
-Okay so now you have a system, now you need a bootloader I'm going to use refind but you could use something like GRUB2 if you wish.
-
-Unpack `refind-bin-x.xx.x.x.zip` into `refind/` directory.
-
-Copy over this files/folders from `refind/refind/` folder into the `tmp/boot/EFI/boot/` folder (if it dosen't exist create it)
-```
-drivers_aa64/
-icons/
-tools_aa64/
-refind_aa64.efi
-```
-
-rename `refind_aa64.efi` to `bootaa64.efi`
-
-Go back into the `tmp/boot` folder
-Rename the `Image.gz` to `vmlinuz-linux.gz`
-
-Create `refind_linux.conf` file and add this line:
-
-> If you don't have mainline device tree add `acpi=force` after the UUID
-```
-"Boot with UUID"   "rw root=UUID=<Arch Linux Root Part UUID>"
-```
-
-You can get the UUID by using the blkid command:
-```
-~/uefi » sudo blkid /dev/sdx2
-/dev/sdx2: UUID="cbcc0246-582a-4edf-933b-8a85011b7646" BLOCK_SIZE="4096" TYPE="ext4" PARTUUID="5f351c6d-8f34-4d6f-b958-f00646d5e640"
-```
-
-In this case UUID would be `cbcc0246-582a-4edf-933b-8a85011b7646`
-
-> NOTE: You might want to add `acpi=force` to the command line, because at the time of writing this guide booting with mainline device tree isn't working
-
-After that unmount device:
-
-```
-[root@wisnia tmp]# umount tmp/boot
-[root@wisnia tmp]# umount tmp/
-[root@wisnia tmp]# sync
-```
-
-## Things to do post installation
-
-### Login
-
-Username: `alarm`
-
-Password: `alarm`
-
-### Connect to the internet
-
-1. Connect USB internet source (USB tethering or USB to Ethernet card)
-2. Run `dhcpcd &` after logging in to get IP address
-3. Check internet access by `ping 1.1.1.1`
-
-### Initialize the pacman keyring and populate the Arch Linux ARM package signing keys
-
-```
-pacman-key --init
-pacman-key --populate archlinuxarm
-```
-After doing this you can now use pacman to install packages
-
-### Install Desktop Environment
-
-> TODO: figure out how to force Xorg to use framebuffer provided by UEFI
+Both formats are supported transparently by `cmdline.txt`.

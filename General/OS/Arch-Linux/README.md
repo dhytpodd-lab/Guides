@@ -17,6 +17,7 @@ The installation uses an **independent, label-based scheme (`ARCH_BOOT` and `ARC
 - [Step 5: Installing the System & Kernel](#step-5-installing-the-system--kernel)
 - [Step 6: System Configuration (fstab, cmdline.txt, users)](#step-6-system-configuration)
 - [Step 7: Booting via UEFI](#step-7-booting-via-uefi)
+- [Step 8: Reverting Back to Stock Android Partitions](#step-8-reverting-back-to-stock-android-partitions)
 - [Troubleshooting & Emergency Restore](#troubleshooting--emergency-restore)
 
 ---
@@ -315,6 +316,114 @@ sync
    - BDS loads `initramfs-linux.img` via the standard `LoadFile2` protocol in RAM.
    - BDS reads `cmdline.txt` and executes the Linux kernel.
    - Systemd detects `LABEL=ARCH_ROOT` and boots cleanly into the Arch Linux console!
+
+---
+
+## 🔄 Step 8: Reverting Back to Stock Android Partitions
+
+If you ever wish to remove Arch Linux and restore your device back to stock Android with **100% of your internal storage restored to `userdata`**, choose one of the two methods below.
+
+---
+
+### Method 1: Automatic Restore from GPT Backup (Recommended)
+
+If you followed [Step 1](#step-1-backup-gpt-partition-tables) and saved `gpt_backup_sda.bin`:
+
+1. Boot your phone into **Recovery** (TWRP / OrangeFox) and connect USB.
+2. Push your backup file to the device if not already present:
+   ```bash
+   adb push gpt_backup_sda.bin /sdcard/
+   ```
+3. Open ADB shell:
+   ```bash
+   adb shell
+   ```
+4. Restore the original GPT partition table:
+   ```bash
+   sgdisk --load-backup=/sdcard/gpt_backup_sda.bin /dev/block/sda
+   ```
+5. Reread partitions and reboot recovery:
+   ```bash
+   partprobe /dev/block/sda 2>/dev/null || true
+   reboot recovery
+   ```
+6. Format `userdata` so Android can initialize a clean filesystem:
+   - In Recovery GUI: **Wipe -> Format Data -> type "yes"**.
+   - Or via ADB shell:
+     ```bash
+     mke2fs -t ext4 -F /dev/block/by-name/userdata
+     ```
+7. Reboot into Android:
+   ```bash
+   reboot
+   ```
+
+---
+
+### Method 2: Manual Reversion with `sgdisk` (Without Backup)
+
+If you lost your backup file, you can easily delete the Linux partitions and expand `userdata` to fill all remaining space on the disk using `sgdisk`:
+
+1. Boot into **Recovery** and enter ADB shell:
+   ```bash
+   adb shell
+   ```
+2. Unmount any active partitions:
+   ```bash
+   umount /mnt/arch/boot 2>/dev/null
+   umount /mnt/arch 2>/dev/null
+   umount /data /sdcard 2>/dev/null
+   ```
+3. Print the partition table:
+   ```bash
+   sgdisk --print /dev/block/sda
+   ```
+   Identify the partition numbers for:
+   - `userdata` (e.g. partition `18`)
+   - `esp` (e.g. partition `19`)
+   - `arch` (e.g. partition `20`)
+   
+   > [!IMPORTANT]
+   > Note down the **Start Sector** of `userdata`! *(e.g. `12345678`)*
+
+4. Delete the Linux partitions (`arch` and `esp`):
+   *(Replace `19` and `20` with your partition numbers)*
+   ```bash
+   sgdisk --delete=20 /dev/block/sda
+   sgdisk --delete=19 /dev/block/sda
+   ```
+
+5. Delete the shrunk `userdata` partition:
+   ```bash
+   sgdisk --delete=18 /dev/block/sda
+   ```
+
+6. Recreate `userdata` starting from its **original Start Sector** and ending at sector `0` (which tells `sgdisk` to automatically fill the entire remainder of the disk):
+   ```bash
+   # Syntax: --new=partnum:start_sector:0
+   # Replace 18 with your userdata partition number and START_SECTOR with its original start sector:
+   sgdisk --new=18:<START_SECTOR>:0 --change-name=18:userdata /dev/block/sda
+   ```
+
+7. Verify the restored table:
+   ```bash
+   sgdisk --print /dev/block/sda
+   ```
+   Notice that `userdata` now spans all the way to the end of `/dev/block/sda`!
+
+8. Reboot recovery to refresh kernel block devices:
+   ```bash
+   reboot recovery
+   ```
+
+9. Format the restored `userdata` partition:
+   - In Recovery GUI: **Wipe -> Format Data -> type "yes"**.
+   - Or in ADB shell:
+     ```bash
+     mke2fs -t ext4 -F /dev/block/by-name/userdata
+     ```
+
+10. Reboot into Android — your original stock partition layout and full storage capacity are completely restored!
 
 ---
 
